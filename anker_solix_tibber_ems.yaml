@@ -1,0 +1,350 @@
+blueprint:
+  name: Anker Solix - Smart Multi-Strategy EMS (15-Min Synchronized)
+  description: "Advanced EMS for Anker Solarbank 3. Supports Target Time (Dynamic or Continuous Block) and Fixed Price Cap strategies, fully synchronized with Tibber's 15-min slots, with smart dynamic status notifications."
+  domain: automation
+  input:
+    solarbank_mode_select:
+      name: Solarbank Usage Mode Select
+      selector:
+        entity:
+          domain: [select]
+    default_smart_mode:
+      name: Default Smart Mode Option
+      description: Normal everyday mode to restore when grid charging is inactive.
+      selector:
+        select:
+          options:
+            - label: "Smart"
+              value: "smart"
+            - label: "Self consumption"
+              value: "smartmeter"
+            - label: "Custom"
+              value: "manual"
+            - label: "Time slot"
+              value: "time_slot"
+    grid_charging_switch:
+      name: Solarbank Backup Option Switch (AC Charging)
+      selector:
+        entity:
+          domain: [switch]
+    ac_power_limit_number:
+      name: Solarbank AC Input Limit (W)
+      selector:
+        entity: {}
+    battery_capacity_sensor:
+      name: Solarbank Battery Capacity (Wh) Sensor
+      selector:
+        entity: {}
+    battery_soc_sensor:
+      name: Battery State of Charge (SoC) Sensor
+      selector:
+        entity:
+          domain: [sensor]
+          device_class: battery
+    optimization_strategy:
+      name: Optimization Strategy
+      default: "target_time"
+      selector:
+        select:
+          options:
+            - label: "Target Completion Time"
+              value: "target_time"
+            - label: "Price Cap / Threshold"
+              value: "price_cap"
+    charging_profile:
+      name: Charging Profile (Only for Target Time)
+      default: "dynamic"
+      selector:
+        select:
+          options:
+            - label: "Dynamic / Split (Cheapest slots distributed)"
+              value: "dynamic"
+            - label: "Continuous / Block (Cheapest consecutive block)"
+              value: "continuous"
+    fixed_price_cap:
+      name: Price Cap Threshold (EUR/kWh)
+      description: Only active under Price Cap Strategy. Charge if current price is below this threshold.
+      default: 0.25
+      selector:
+        number:
+          min: 0.0
+          max: 1.0
+          step: 0.01
+          unit_of_measurement: "€"
+          mode: box
+    ignore_target_time_in_price_cap:
+      name: Ignore Target Time in Price Cap Mode
+      description: If enabled, Run Once will NOT turn off the automation at the target time while in Price Cap mode. It will keep running across days until Target SoC is fully reached.
+      default: false
+      selector:
+        boolean: {}
+    target_soc_percentage:
+      name: Target SoC (%)
+      default: 50
+      selector:
+        number:
+          min: 10
+          max: 100
+          step: 5
+          unit_of_measurement: "%"
+          mode: slider
+    target_completion_time:
+      name: Target Completion Time
+      default: "06:00:00"
+      selector:
+        time: {}
+    execution_mode:
+      name: Run Mode
+      default: "always"
+      selector:
+        select:
+          options:
+            - label: "Run Always"
+              value: "always"
+            - label: "Run Once"
+              value: "once"
+    notify_device:
+      name: Notification Device (Optional)
+      description: Select the mobile device to receive event push notifications. Leave empty to disable notifications.
+      default: none
+      selector:
+        device:
+          integration: mobile_app
+    notification_events:
+      name: Notification Events
+      description: Select which events should trigger a push notification on your phone.
+      default: []
+      selector:
+        select:
+          multiple: true
+          options:
+            - label: "Grid Charging Started"
+              value: "on_charge_start"
+            - label: "Target SoC Reached"
+              value: "on_target_reached"
+            - label: "Target Completion Time Passed"
+              value: "on_target_time_passed"
+mode: single
+max_exceeded: silent
+variables:
+  mode_select_entity: !input solarbank_mode_select
+  normal_smart_mode: !input default_smart_mode
+  charge_switch_entity: !input grid_charging_switch
+  ac_limit_entity: !input ac_power_limit_number
+  capacity_sensor_entity: !input battery_capacity_sensor
+  soc_sensor_entity: !input battery_soc_sensor
+  optimization_strategy: !input optimization_strategy
+  charging_profile: !input charging_profile
+  price_cap: !input fixed_price_cap
+  ignore_target_time: !input ignore_target_time_in_price_cap
+  target_soc: !input target_soc_percentage
+  target_time_raw: !input target_completion_time
+  run_mode: !input execution_mode
+  notify_device: !input notify_device
+  notify_events: !input notification_events
+trigger:
+- platform: time_pattern
+  minutes: 0
+- platform: time_pattern
+  minutes: 15
+- platform: time_pattern
+  minutes: 30
+- platform: time_pattern
+  minutes: 45
+action:
+- service: tibber.get_prices
+  data:
+    start: "{{ today_at('00:00').isoformat() }}"
+    end: "{{ (today_at('00:00') + timedelta(days=2)).isoformat() }}"
+  response_variable: tibber_response
+- variables:
+    target_today_ts: "{{ today_at(target_time_raw).timestamp() }}"
+    target_time_ts: >-
+      {% if now().timestamp() > target_today_ts %}
+        {{ (today_at(target_time_raw) + timedelta(days=1)).timestamp() }}
+      {% else %}
+        {{ target_today_ts }}
+      {% endif %}
+    prices: >-
+      {% if 'prices' in tibber_response and 'Adam' in tibber_response.prices and tibber_response.prices.Adam is sequence %}
+        {% set ns = namespace(items=[]) %}
+        {% set current_ts = now().timestamp() %}
+        {% for p in tibber_response.prices.Adam %}
+          {% set slot_ts = as_timestamp(p.start_time) %}
+          {% if slot_ts < (target_time_ts | float) and slot_ts >= (current_ts - 900) %}
+            {% set ns.items = ns.items + [p] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.items }}
+      {% else %}
+        {{ none }}
+      {% endif %}
+    current_soc: "{{ states(soc_sensor_entity) | float(0) }}"
+    needed_soc: "{{ (target_soc | float) - current_soc }}"
+    ac_limit_w: "{{ states(ac_limit_entity) | float(1200) }}"
+    total_capacity_wh: "{{ states(capacity_sensor_entity) | float(8064) }}"
+    soc_increase_per_slot: >-
+      {% if total_capacity_wh > 0 %}
+        {{ ((ac_limit_w * 0.25) / total_capacity_wh) * 100 }}
+      {% else %}
+        3.72
+      {% endif %}
+    slots_required: >-
+      {% if needed_soc <= 0 or soc_increase_per_slot <= 0 %}
+        0
+      {% else %}
+        {{ ((needed_soc / soc_increase_per_slot) | round(0, 'ceil')) | int }}
+      {% endif %}
+    slots_remaining_until_target: >-
+      {{ (((target_time_ts | float) - now().timestamp()) / 900) | round(0, 'ceil') | int }}
+    is_current_slot_cheap: >-
+      {% if slots_required > 0 %}
+        {% if optimization_strategy == 'price_cap' %}
+          {% set current_time_str = now().strftime('%Y-%m-%dT%H:%M') %}
+          {% set current_slot = prices | selectattr('start_time', 'match', current_time_str[:16]) | first | default(none) %}
+          {% if current_slot and (current_slot.price | float) <= (price_cap | float) %}
+            true
+          {% else %}
+            false
+          {% endif %}
+        {% else %}
+          {% if slots_remaining_until_target <= slots_required %}
+            true
+          {% elif not prices %}
+            false
+          {% else %}
+            {% set current_ts = now().timestamp() %}
+            {% if charging_profile == 'dynamic' %}
+              {% set sorted_slots = prices | sort(attribute='price') %}
+              {% set target_cheap_slots = sorted_slots[:slots_required] %}
+              {% set ns = namespace(matched=false) %}
+              {% for slot in target_cheap_slots %}
+                {% set slot_start = as_timestamp(slot.start_time) %}
+                {% if current_ts >= slot_start and current_ts < (slot_start + 900) %}
+                  {% set ns.matched = true %}
+                {% endif %}
+              {% endfor %}
+              {{ ns.matched }}
+            {% else %}
+              {% set ns_block = namespace(best_idx=0, min_sum=99999) %}
+              {% set loop_limit = (prices | length) - slots_required + 1 %}
+              {% if loop_limit > 0 %}
+                {% for i in range(0, loop_limit) %}
+                  {% set current_sum = namespace(val=0.0) %}
+                  {% for j in range(0, slots_required) %}
+                    {% set current_sum.val = current_sum.val + (prices[i+j].price | float) %}
+                  {% endfor %}
+                  {% if current_sum.val < ns_block.min_sum %}
+                    {% set ns_block.min_sum = current_sum.val %}
+                    {% set ns_block.best_idx = i %}
+                  {% endif %}
+                {% endfor %}
+                {% set best_start_ts = as_timestamp(prices[ns_block.best_idx].start_time) %}
+                {% set best_end_ts = as_timestamp(prices[ns_block.best_idx + slots_required - 1].start_time) + 900 %}
+                {{ current_ts >= best_start_ts and current_ts < best_end_ts }}
+              {% else %}
+                true
+              {% endif %}
+            {% endif %}
+          {% endif %}
+        {% endif %}
+      {% else %}
+        false
+      {% endif %}
+    calculated_target_state: "{% if current_soc < (target_soc | float) and is_current_slot_cheap %}charge{% else %}smart{% endif %}"
+    current_mode: "{{ states(mode_select_entity) }}"
+    current_charge_switch: "{{ states(charge_switch_entity) }}"
+- choose:
+  - conditions:
+    - condition: template
+      value_template: "{{ calculated_target_state == 'charge' }}"
+    sequence:
+    - choose:
+      - conditions:
+        - condition: template
+          value_template: "{{ current_mode != 'backup' or current_charge_switch != 'on' }}"
+        sequence:
+        - service: select.select_option
+          target:
+            entity_id: !input solarbank_mode_select
+          data:
+            option: "backup"
+        - delay: 00:00:02
+        - service: switch.turn_on
+          target:
+            entity_id: !input grid_charging_switch
+        - choose:
+          - conditions:
+            - condition: template
+              value_template: "{{ notify_device != none and 'on_charge_start' in notify_events }}"
+            sequence:
+            - service: notify.mobile_app_{{ device_attr(notify_device, 'name') | slugify }}
+              data:
+                title: "Anker Solix EMS"
+                message: "Grid charging initiated at {{ current_soc }}%. Target: {{ target_soc }}%."
+        - service: logbook.log
+          data:
+            name: Anker Solix Target SoC EMS
+            message: "Grid charging active: {{ current_soc }}% -> {{ target_soc }}%."
+            entity_id: !input grid_charging_switch
+  - conditions:
+    - condition: template
+      value_template: "{{ calculated_target_state == 'smart' }}"
+    sequence:
+    - choose:
+      - conditions:
+        - condition: template
+          value_template: "{{ current_mode == 'backup' or current_charge_switch == 'on' }}"
+        sequence:
+        - service: switch.turn_off
+          target:
+            entity_id: !input grid_charging_switch
+        - service: select.select_option
+          target:
+            entity_id: !input solarbank_mode_select
+          data:
+            option: "{{ normal_smart_mode }}"
+        - choose:
+          - conditions:
+            - condition: template
+              value_template: "{{ notify_device != none }}"
+            sequence:
+            - choose:
+              - conditions:
+                - condition: template
+                  value_template: "{{ current_soc >= (target_soc | float) and 'on_target_reached' in notify_events }}"
+                sequence:
+                - service: notify.mobile_app_{{ device_attr(notify_device, 'name') | slugify }}
+                  data:
+                    title: "Anker Solix EMS"
+                    message: >-
+                      Target SoC reached successfully! Battery is at {{ current_soc }}%.
+                      {% if run_mode == 'once' %}Automation will now self-deactivate.{% else %}⚠️ Note: Automation is in ALWAYS RUN mode and remains active for future slots.{% endif %}
+              - conditions:
+                - condition: template
+                  value_template: "{{ slots_remaining_until_target <= 0 and 'on_target_time_passed' in notify_events }}"
+                sequence:
+                - service: notify.mobile_app_{{ device_attr(notify_device, 'name') | slugify }}
+                  data:
+                    title: "Anker Solix EMS"
+                    message: >-
+                      Target completion time passed. Battery is at {{ current_soc }}% (Target: {{ target_soc }}%).
+                      {% if run_mode == 'once' %}Automation will now self-deactivate.{% else %}⚠️ Note: System remains active in ALWAYS RUN mode.{% endif %}
+        - service: logbook.log
+          data:
+            name: Anker Solix Target SoC EMS
+            message: "Target SoC reached or cheap slot passed. Restored normal mode: {{ normal_smart_mode }}."
+            entity_id: !input solarbank_mode_select
+- choose:
+  - conditions:
+    - condition: template
+      value_template: >-
+        {{ run_mode == 'once' and (
+          current_soc >= (target_soc | float) or 
+          (optimization_strategy == 'target_time' and slots_remaining_until_target <= 0) or
+          (optimization_strategy == 'price_cap' and not ignore_target_time and slots_remaining_until_target <= 0)
+        ) }}
+    sequence:
+    - service: automation.turn_off
+      target:
+        entity_id: "{{ this.entity_id }}"
