@@ -203,16 +203,12 @@ action:
     slots_remaining_until_target: >-
       {{ (((target_time_ts | float) - now().timestamp()) / 900) | round(0, 'ceil') | int }}
     is_current_slot_cheap: >-
-      {% if slots_required > 0 %}
-        {% if optimization_strategy == 'price_cap' %}
-          {% set current_time_str = now().strftime('%Y-%m-%dT%H:%M') %}
-          {% set current_slot = prices | selectattr('start_time', 'match', current_time_str[:16]) | first | default(none) %}
-          {% if current_slot and (current_slot.price | float) <= (price_cap | float) %}
-            true
-          {% else %}
-            false
-          {% endif %}
-        {% else %}
+      {% if optimization_strategy == 'price_cap' %}
+        {% set current_time_str = now().strftime('%Y-%m-%dT%H:%M') %}
+        {% set current_slot = prices | selectattr('start_time', 'match', current_time_str[:16]) | first | default(none) %}
+        {{ current_slot is not none and (current_slot.price | float(1.0)) <= (price_cap | float(0.25)) }}
+      {% else %}
+        {% if slots_required > 0 %}
           {% if slots_remaining_until_target <= slots_required %}
             true
           {% elif not prices %}
@@ -252,9 +248,9 @@ action:
               {% endif %}
             {% endif %}
           {% endif %}
+        {% else %}
+          false
         {% endif %}
-      {% else %}
-        false
       {% endif %}
     calculated_target_state: "{% if current_soc < (target_soc | float) and is_current_slot_cheap %}charge{% else %}smart{% endif %}"
     current_mode: "{{ states(mode_select_entity) }}"
