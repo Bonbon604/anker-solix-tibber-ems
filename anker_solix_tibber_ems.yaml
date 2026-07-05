@@ -166,16 +166,21 @@ action:
         {{ target_today_ts }}
       {% endif %}
     prices: >-
-      {% if 'prices' in tibber_response and 'Adam' in tibber_response.prices and tibber_response.prices.Adam is sequence %}
-        {% set ns = namespace(items=[]) %}
-        {% set current_ts = now().timestamp() %}
-        {% for p in tibber_response.prices.Adam %}
-          {% set slot_ts = as_timestamp(p.start_time) %}
-          {% if slot_ts < (target_time_ts | float) and slot_ts >= (current_ts - 900) %}
-            {% set ns.items = ns.items + [p] %}
-          {% endif %}
-        {% endfor %}
-        {{ ns.items }}
+      {% if 'prices' in tibber_response and tibber_response.prices.keys() | length > 0 %}
+        {% set first_home = tibber_response.prices.keys() | first %}
+        {% if tibber_response.prices[first_home] is sequence %}
+          {% set ns = namespace(items=[]) %}
+          {% set current_ts = now().timestamp() %}
+          {% for p in tibber_response.prices[first_home] %}
+            {% set slot_ts = as_timestamp(p.start_time) %}
+            {% if slot_ts < (target_time_ts | float) and slot_ts >= (current_ts - 900) %}
+              {% set ns.items = ns.items + [p] %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.items }}
+        {% else %}
+          {{ none }}
+        {% endif %}
       {% else %}
         {{ none }}
       {% endif %}
